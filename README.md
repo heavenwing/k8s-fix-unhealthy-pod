@@ -7,11 +7,41 @@ This is a simple program to fix the unhealthy pod with error message 'context de
 create below CronJob to run the program every 5 minutes
 
 ```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: podfixer-account
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: podfixer-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: podfixer-role-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: podfixer-role
+subjects:
+  - kind: ServiceAccount
+    name: podfixer-account
+    namespace: default
+---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: fix-unhealthy-pod-job
-  namespace: kube-system
+  namespace: default
 spec:
   schedule: "*/5 * * * *"
   jobTemplate:
@@ -21,7 +51,7 @@ spec:
           containers:
             - name: fix-unhealthy-pod
               image: ghcr.io/heavenwing/k8s-fix-unhealthy-pod:main
-          serviceAccountName: pod-garbage-collector
+          serviceAccountName: podfixer-account
           restartPolicy: "Never"
 ```
 
