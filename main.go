@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/microsoft/ApplicationInsights-Go/appinsights"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -35,16 +35,10 @@ func main() {
 
 	var aiclient appinsights.TelemetryClient
 	if os.Getenv("APPINSIGHTS_INSTRUMENTATIONKEY") != "" {
-		telemetryConfig := appinsights.NewTelemetryConfiguration(os.Getenv("APPINSIGHTS_INSTRUMENTATIONKEY"))
-		if os.Getenv("APPINSIGHTS_ENDPOINTURL") != "" {
-			telemetryConfig.EndpointUrl = os.Getenv("APPINSIGHTS_ENDPOINTURL")
-		}
-		aiclient = appinsights.NewTelemetryClientFromConfig(telemetryConfig)
-		aiclient.Context().CommonProperties["RoleName"] = roleName
+		aiclient = createTelemetryClient()
 	}
 
-	eventListOptions := metav1.ListOptions{FieldSelector: "reason=Unhealthy,involvedObject.kind=Pod"}
-	events, err := k8sclient.CoreV1().Events(ns).List(context.Background(), eventListOptions)
+	events, err := getUnhealthyPodEvents(k8sclient, ns)
 	if err != nil {
 		log.Fatalln("failed to get events:", err)
 	}
@@ -53,31 +47,53 @@ func main() {
 
 	// kill unhealthy pods
 	for i, event := range events.Items {
-		//check event message containes "context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
-		if strings.Contains(event.Message, "context deadline exceeded (Client.Timeout exceeded while awaiting headers)") {
-			var msg string
-			msg = fmt.Sprintf("will process unhealthy pod. name is [%s]...\n", event.InvolvedObject.Name)
-			log.Print(msg)
-			if aiclient != nil {
-				aiclient.TrackTrace(roleName+": "+msg, appinsights.Information)
-			}
-			pod, err := k8sclient.CoreV1().Pods(ns).Get(context.Background(), event.InvolvedObject.Name, metav1.GetOptions{})
-			if err != nil {
-				log.Println("ERROR: failed to get pod:", err)
-				continue
-			}
-
-			deleteUnhealthyPod(i, pod.Name, k8sclient, ns)
-			msg = fmt.Sprintf("processed unhealthy pod. name is [%s]...\n", event.InvolvedObject.Name)
-			log.Print(msg)
-			if aiclient != nil {
-				aiclient.TrackTrace(roleName+": "+msg, appinsights.Information)
-			}
+		if shouldProcessUnhealthyPod(event) {
+			processUnhealthyPod(i, event, k8sclient, ns, aiclient)
 		}
 	}
 
 	fmt.Println("all proccessed!")
 	fmt.Println("bye!")
+}
+
+func shouldProcessUnhealthyPod(event corev1.Event) bool {
+	return strings.Contains(event.Message, "context deadline exceeded (Client.Timeout exceeded while awaiting headers)")
+}
+
+func processUnhealthyPod(i int, event corev1.Event, k8sclient *kubernetes.Clientset, ns string, aiclient appinsights.TelemetryClient) {
+	var msg string
+	msg = fmt.Sprintf("will process unhealthy pod. name is [%s]...\n", event.InvolvedObject.Name)
+	log.Print(msg)
+	if aiclient != nil {
+		aiclient.TrackTrace(msg, appinsights.Information)
+	}
+	pod, err := k8sclient.CoreV1().Pods(ns).Get(context.Background(), event.InvolvedObject.Name, metav1.GetOptions{})
+	if err != nil {
+		log.Println("ERROR: failed to get pod:", err)
+		return
+	}
+
+	deleteUnhealthyPod(i, pod.Name, k8sclient, ns)
+	msg = fmt.Sprintf("processed unhealthy pod. name is [%s]...\n", event.InvolvedObject.Name)
+	log.Print(msg)
+	if aiclient != nil {
+		aiclient.TrackTrace(msg, appinsights.Information)
+	}
+}
+
+func getUnhealthyPodEvents(k8sclient *kubernetes.Clientset, ns string) (*corev1.EventList, error) {
+	eventListOptions := metav1.ListOptions{FieldSelector: "reason=Unhealthy,involvedObject.kind=Pod"}
+	return k8sclient.CoreV1().Events(ns).List(context.Background(), eventListOptions)
+}
+
+func createTelemetryClient() appinsights.TelemetryClient {
+	telemetryConfig := appinsights.NewTelemetryConfiguration(os.Getenv("APPINSIGHTS_INSTRUMENTATIONKEY"))
+	if os.Getenv("APPINSIGHTS_ENDPOINTURL") != "" {
+		telemetryConfig.EndpointUrl = os.Getenv("APPINSIGHTS_ENDPOINTURL")
+	}
+	aiclient := appinsights.NewTelemetryClientFromConfig(telemetryConfig)
+	aiclient.Context().CommonProperties["AppRoleName"] = roleName
+	return aiclient
 }
 
 func deleteUnhealthyPod(i int, name string, k8sclient *kubernetes.Clientset, ns string) {
@@ -99,13 +115,7 @@ func deleteUnhealthyPod(i int, name string, k8sclient *kubernetes.Clientset, ns 
 func getK8sConfig() *rest.Config {
 	config, err := clientcmd.BuildConfigFromFlags("", "")
 	if err != nil {
-		kubeconfig := filepath.Join(os.Getenv("HOME"), ".kube", "config")
-		log.Println("Using kubeconfig file: ", kubeconfig)
-
-		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-		if err != nil {
-			log.Fatal(err)
-		}
+		log.Fatal(err)
 	}
 	return config
 }
